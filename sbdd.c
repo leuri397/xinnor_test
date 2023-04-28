@@ -20,6 +20,9 @@
 #include <linux/moduleparam.h>
 #include <linux/spinlock_types.h>
 
+#include <linux/fs.h>
+#include <linux/blkdev.h>
+
 #define SBDD_SECTOR_SHIFT      9
 #define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
@@ -39,21 +42,25 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+	void (*process_bio)(struct bio *bio);
+	struct block_device		*blk_dev;
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
-static char *devname  = NULL;
+static char *__devname  = NULL;
 static int dev_mode = RAMDRIVE;
-//TODO: make variable to hold block_device
-//TODO: use data spinlock during requests snd mode changes
 
 static void sbdd_xfer_bio_ram(struct bio *bio);
+static void sbdd_xfer_bio_blkdev(struct bio *bio);
+static void __dealloc_ramdrive(void);
+static int __alloc_ramdrive(void);
 
-static void (*process_bio)(struct bio *bio) = sbdd_xfer_bio_ram;
 
 static int devmode_op_write_handler(const char *val, const struct kernel_param *kp) {
+
+	//TODO: Add On the fly mode change
 	char valcp[16];
 	char *s;
 
@@ -99,17 +106,33 @@ static int devmode_op_read_handler(char *buffer, const struct kernel_param *kp) 
 	return strlen(buffer);
 }
 
-// TODO: Write methods to release block device
-
-static void __dealloc_ramdrive() {
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
+static int __acquire_blkdev(void) {
+	if (__devname == NULL)
+	{
+		pr_err("No name for block device provided");
+		return -EINVAL;
+	}
+	__sbdd.blk_dev = blkdev_get_by_path(__devname, FMODE_READ | FMODE_WRITE | FMODE_EXCL, THIS_MODULE);
+	if (IS_ERR(__sbdd.blk_dev))
+	{
+		pr_err("Error occured during opening of block_device");
+		return -EINVAL;
 	}
 	return 0;
 }
 
-static int __alloc_ramdrive() {
+static void __release_blkdev(void) {
+	blkdev_put(__sbdd.blk_dev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+}
+
+static void __dealloc_ramdrive(void) {
+	if (__sbdd.data) {
+		pr_info("freeing data\n");
+		vfree(__sbdd.data);
+	}
+}
+
+static int __alloc_ramdrive(void) {
 	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
 	if (!__sbdd.data) {
 		pr_err("unable to alloc data\n");
@@ -131,18 +154,19 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	offset = pos << SBDD_SECTOR_SHIFT;
 	nbytes = len << SBDD_SECTOR_SHIFT;
 
-	spin_lock(&__sbdd.datalock);
-
 	if (dir)
 		memcpy(__sbdd.data + offset, buff, nbytes);
 	else
 		memcpy(buff, __sbdd.data + offset, nbytes);
 
-	spin_unlock(&__sbdd.datalock);
-
 	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
 
 	return len;
+}
+
+static void sbdd_xfer_bio_blkdev(struct bio *bio) {
+	pr_err("NOT IMPLEMENTED");
+	//TODO: Implement request relay
 }
 
 static void sbdd_xfer_bio_ram(struct bio *bio)
@@ -166,7 +190,15 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 
 	atomic_inc(&__sbdd.refs_cnt);
 
-	(*process_bio)(bio);
+	/*
+	Since we now could have situation with method changing during IO,
+	we move datalock from copying in memory to performing request
+	*/
+
+	spin_lock(&__sbdd.datalock);
+	__sbdd.process_bio(bio);
+	spin_unlock(&__sbdd.datalock);
+
 	bio_endio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
@@ -206,10 +238,15 @@ static int sbdd_create(void)
 	{
 		int ret_alloc_ram = __alloc_ramdrive();
 		if(!ret_alloc_ram)
-		return ret_alloc_ram;
+			return ret_alloc_ram;
+		__sbdd.process_bio = sbdd_xfer_bio_ram;
 	}
 	else if (dev_mode == BLKDEV) {
-		//TODO: Write code to acquire blkdev
+		int ret_acq_blkdev = __acquire_blkdev();
+		if(!ret_acq_blkdev) {
+			return ret_acq_blkdev;
+		}
+		__sbdd.process_bio = sbdd_xfer_bio_blkdev;
 	}
 	else
 		{
@@ -278,7 +315,7 @@ static void sbdd_delete(void)
 	if (dev_mode == RAMDRIVE)
 		__dealloc_ramdrive();
 	else if (dev_mode == BLKDEV) {
-		//TODO: write code to dealloc blkdev
+		__release_blkdev();
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
@@ -338,6 +375,7 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, 0444);
+module_param_named(block_device, __devname, charp, 0444);
 module_param_cb(device_mode, &devmode_op_ops, NULL, 0664);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
