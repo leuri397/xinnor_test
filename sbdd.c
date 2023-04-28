@@ -44,13 +44,14 @@ struct sbdd {
 	struct request_queue    *q;
 	void (*process_bio)(struct bio *bio);
 	struct block_device		*blk_dev;
+	sector_t 				start_sect;
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
 static char *__devname  = NULL;
-static int dev_mode = RAMDRIVE;
+static int dev_mode 	= RAMDRIVE;
 
 static void sbdd_xfer_bio_ram(struct bio *bio);
 static void sbdd_xfer_bio_blkdev(struct bio *bio);
@@ -112,17 +113,19 @@ static int __acquire_blkdev(void) {
 		pr_err("No name for block device provided");
 		return -EINVAL;
 	}
-	__sbdd.blk_dev = blkdev_get_by_path(__devname, FMODE_READ | FMODE_WRITE | FMODE_EXCL, THIS_MODULE);
+	__sbdd.blk_dev = blkdev_get_by_path(__devname, FMODE_READ | FMODE_WRITE, THIS_MODULE);
 	if (IS_ERR(__sbdd.blk_dev))
 	{
 		pr_err("Error occured during opening of block_device");
 		return -EINVAL;
 	}
+	pr_info("acquired block device %s", __sbdd.blk_dev->bd_disk->disk_name);
+	pr_info("with partition number %d", __sbdd.blk_dev->bd_partno);
 	return 0;
 }
 
 static void __release_blkdev(void) {
-	blkdev_put(__sbdd.blk_dev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+	blkdev_put(__sbdd.blk_dev, FMODE_READ | FMODE_WRITE);
 }
 
 static void __dealloc_ramdrive(void) {
@@ -138,6 +141,7 @@ static int __alloc_ramdrive(void) {
 		pr_err("unable to alloc data\n");
 		return -ENOMEM;
 	}
+	pr_info("allocated RAMdisk");
 	return 0;
 }
 
@@ -154,10 +158,12 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	offset = pos << SBDD_SECTOR_SHIFT;
 	nbytes = len << SBDD_SECTOR_SHIFT;
 
+	spin_lock(&__sbdd.datalock);
 	if (dir)
 		memcpy(__sbdd.data + offset, buff, nbytes);
 	else
 		memcpy(buff, __sbdd.data + offset, nbytes);
+	spin_unlock(&__sbdd.datalock);
 
 	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
 
@@ -165,8 +171,17 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 }
 
 static void sbdd_xfer_bio_blkdev(struct bio *bio) {
-	pr_err("NOT IMPLEMENTED");
-	//TODO: Implement request relay
+	pr_info("Requested start and length %d %d", bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+	struct bio *new_bio = bio_clone_fast(bio, GFP_KERNEL, &fs_bio_set);
+	pr_info("Cloned BIO. BIO device: %s", new_bio->bi_disk->disk_name);
+	bio_set_dev(new_bio, __sbdd.blk_dev);
+	// Respect partitions
+	// new_bio->bi_iter.bi_sector += __sbdd.start_sect;
+	pr_info("New BIO start and length %d %d", new_bio->bi_iter.bi_sector, new_bio->bi_iter.bi_size);
+	pr_info("Cloned BIO device: %s", new_bio->bi_disk->disk_name);
+	submit_bio_wait(new_bio);
+	pr_info("Submitted new BIO");
+	bio_put(new_bio);
 }
 
 static void sbdd_xfer_bio_ram(struct bio *bio)
@@ -195,10 +210,10 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 	we move datalock from copying in memory to performing request
 	*/
 
-	spin_lock(&__sbdd.datalock);
+	bio_get(bio);
 	__sbdd.process_bio(bio);
-	spin_unlock(&__sbdd.datalock);
-
+	bio_put(bio);
+	
 	bio_endio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
@@ -230,23 +245,32 @@ static int sbdd_create(void)
 		return -EBUSY;
 	}
 
+	int sector_size = SBDD_SECTOR_SIZE;
 	memset(&__sbdd, 0, sizeof(struct sbdd));
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
-
+	
 	pr_info("allocating data\n");
 	if (dev_mode == RAMDRIVE)
 	{
+		__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 		int ret_alloc_ram = __alloc_ramdrive();
-		if(!ret_alloc_ram)
-			return ret_alloc_ram;
+		if(ret_alloc_ram)
+		{
+			pr_err("__alloc_ramdrive returned %d", ret_alloc_ram);
+			return -EINVAL;
+		}
 		__sbdd.process_bio = sbdd_xfer_bio_ram;
 	}
 	else if (dev_mode == BLKDEV) {
 		int ret_acq_blkdev = __acquire_blkdev();
-		if(!ret_acq_blkdev) {
-			return ret_acq_blkdev;
+		if(ret_acq_blkdev) {
+			pr_err("__acquire_blkdev returned %d", ret_acq_blkdev);
+			return -EINVAL;
 		}
 		__sbdd.process_bio = sbdd_xfer_bio_blkdev;
+		__sbdd.capacity = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->nr_sects;
+		__sbdd.start_sect = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->start_sect;
+		sector_size = __sbdd.blk_dev->bd_block_size;
+		pr_info("Set sector size for device %d", sector_size);
 	}
 	else
 		{
@@ -266,7 +290,7 @@ static int sbdd_create(void)
 	blk_queue_make_request(__sbdd.q, sbdd_make_request);
 
 	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.q, SBDD_SECTOR_SIZE);
+	blk_queue_logical_block_size(__sbdd.q, sector_size);
 
 	/* A disk must have at least one minor */
 	pr_info("allocating disk\n");
