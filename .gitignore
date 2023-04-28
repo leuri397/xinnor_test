@@ -1,1 +1,11 @@
 .wip/
+*.o
+*.ko
+.sbdd.ko.cmd
+.sbdd.mod.cmd
+.sbdd.mod.o.cmd
+.sbdd.o.cmd
+Module.symvers
+modules.order
+sbdd.mod
+sbdd.mod.c
