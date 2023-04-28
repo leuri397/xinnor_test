@@ -9,3 +9,4 @@ Module.symvers
 modules.order
 sbdd.mod
 sbdd.mod.c
+.vscode/

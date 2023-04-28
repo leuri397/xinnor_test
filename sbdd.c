@@ -25,6 +25,11 @@
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
 
+enum dev_mode {
+	RAMDRIVE,
+	BLKDEV
+};
+
 struct sbdd {
 	wait_queue_head_t       exitwait;
 	spinlock_t              datalock;
@@ -39,6 +44,79 @@ struct sbdd {
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
+static char *devname  = NULL;
+static int dev_mode = RAMDRIVE;
+//TODO: make variable to hold block_device
+//TODO: use data spinlock during requests snd mode changes
+
+static void sbdd_xfer_bio_ram(struct bio *bio);
+
+static void (*process_bio)(struct bio *bio) = sbdd_xfer_bio_ram;
+
+static int devmode_op_write_handler(const char *val, const struct kernel_param *kp) {
+	char valcp[16];
+	char *s;
+
+	strncpy(valcp, val, 16);
+	valcp[15] = '\0';
+	
+	s = strstrip(valcp);
+
+	if (strcmp(s, "ram") == 0)
+	{
+		if(dev_mode == BLKDEV)
+		{
+			dev_mode = RAMDRIVE;
+		}
+		return 0;
+	}
+	else if (strcmp(s, "blkdev") == 0)
+	{
+		if(dev_mode == RAMDRIVE)
+		{
+			dev_mode = BLKDEV;
+		}
+		return 0;
+	}
+	else
+		return -EINVAL;
+};
+
+static int devmode_op_read_handler(char *buffer, const struct kernel_param *kp) {
+	switch (dev_mode) {
+	case RAMDRIVE:
+		strcpy(buffer, "ram");
+		break;
+
+	case BLKDEV:
+		strcpy(buffer, "blkdev");
+		break;
+
+	default:
+		strcpy(buffer, "error");
+		break;
+	}
+	return strlen(buffer);
+}
+
+// TODO: Write methods to release block device
+
+static void __dealloc_ramdrive() {
+	if (__sbdd.data) {
+		pr_info("freeing data\n");
+		vfree(__sbdd.data);
+	}
+	return 0;
+}
+
+static int __alloc_ramdrive() {
+	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
+	if (!__sbdd.data) {
+		pr_err("unable to alloc data\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -67,7 +145,7 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	return len;
 }
 
-static void sbdd_xfer_bio(struct bio *bio)
+static void sbdd_xfer_bio_ram(struct bio *bio)
 {
 	struct bvec_iter iter;
 	struct bio_vec bvec;
@@ -88,7 +166,7 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 
 	atomic_inc(&__sbdd.refs_cnt);
 
-	sbdd_xfer_bio(bio);
+	(*process_bio)(bio);
 	bio_endio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
@@ -124,11 +202,20 @@ static int sbdd_create(void)
 	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 
 	pr_info("allocating data\n");
-	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
+	if (dev_mode == RAMDRIVE)
+	{
+		int ret_alloc_ram = __alloc_ramdrive();
+		if(!ret_alloc_ram)
+		return ret_alloc_ram;
 	}
+	else if (dev_mode == BLKDEV) {
+		//TODO: Write code to acquire blkdev
+	}
+	else
+		{
+			pr_err("Unknown device mode");
+			return -EINVAL;
+		}
 
 	spin_lock_init(&__sbdd.datalock);
 	init_waitqueue_head(&__sbdd.exitwait);
@@ -188,9 +275,10 @@ static void sbdd_delete(void)
 	if (__sbdd.gd)
 		put_disk(__sbdd.gd);
 
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
+	if (dev_mode == RAMDRIVE)
+		__dealloc_ramdrive();
+	else if (dev_mode == BLKDEV) {
+		//TODO: write code to dealloc blkdev
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
@@ -236,6 +324,12 @@ static void __exit sbdd_exit(void)
 	pr_info("exiting complete\n");
 }
 
+
+static const struct kernel_param_ops devmode_op_ops = {
+	.set = devmode_op_write_handler,
+	.get = devmode_op_read_handler
+};
+
 /* Called on module loading. Is mandatory. */
 module_init(sbdd_init);
 
@@ -243,7 +337,8 @@ module_init(sbdd_init);
 module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
-module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, 0444);
+module_param_cb(device_mode, &devmode_op_ops, NULL, 0664);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
