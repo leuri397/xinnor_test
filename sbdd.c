@@ -20,10 +20,18 @@
 #include <linux/moduleparam.h>
 #include <linux/spinlock_types.h>
 
+#include <linux/fs.h>
+#include <linux/blkdev.h>
+
 #define SBDD_SECTOR_SHIFT      9
 #define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
+
+enum dev_mode {
+	RAMDRIVE,
+	BLKDEV
+};
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -34,11 +42,105 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+	void (*process_bio)(struct bio *bio);
+	struct block_device		*blk_dev;
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
+static char *__devname  = NULL;
+static int dev_mode 	= RAMDRIVE;
+
+static void sbdd_xfer_bio_ram(struct bio *bio);
+static void sbdd_xfer_bio_blkdev(struct bio *bio);
+static void __dealloc_ramdrive(void);
+static int __alloc_ramdrive(void);
+
+
+static int devmode_op_write_handler(const char *val, const struct kernel_param *kp) {
+	char valcp[16];
+	char *s;
+
+	strncpy(valcp, val, 16);
+	valcp[15] = '\0';
+	
+	s = strstrip(valcp);
+
+	if (strcmp(s, "ram") == 0)
+	{
+		if(dev_mode == BLKDEV)
+		{
+			dev_mode = RAMDRIVE;
+		}
+		return 0;
+	}
+	else if (strcmp(s, "blkdev") == 0)
+	{
+		if(dev_mode == RAMDRIVE)
+		{
+			dev_mode = BLKDEV;
+		}
+		return 0;
+	}
+	else
+		return -EINVAL;
+};
+
+static int devmode_op_read_handler(char *buffer, const struct kernel_param *kp) {
+	switch (dev_mode) {
+	case RAMDRIVE:
+		strcpy(buffer, "ram");
+		break;
+
+	case BLKDEV:
+		strcpy(buffer, "blkdev");
+		break;
+
+	default:
+		strcpy(buffer, "error");
+		break;
+	}
+	return strlen(buffer);
+}
+
+static int __acquire_blkdev(void) {
+	if (__devname == NULL)
+	{
+		pr_err("No name for block device provided");
+		return -EINVAL;
+	}
+	__sbdd.blk_dev = blkdev_get_by_path(__devname, FMODE_READ | FMODE_WRITE | FMODE_EXCL, THIS_MODULE);
+	if (IS_ERR(__sbdd.blk_dev))
+	{
+		pr_err("Error occured during opening of block_device");
+		return -EINVAL;
+	}
+	pr_info("acquired block device %s", __sbdd.blk_dev->bd_disk->disk_name);
+	pr_info("with partition number %d", __sbdd.blk_dev->bd_partno);
+	return 0;
+}
+
+static void __release_blkdev(void) {
+	blkdev_put(__sbdd.blk_dev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+}
+
+static void __dealloc_ramdrive(void) {
+	if (__sbdd.data) {
+		pr_info("freeing data\n");
+		vfree(__sbdd.data);
+	}
+}
+
+static int __alloc_ramdrive(void) {
+	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
+	if (!__sbdd.data) {
+		pr_err("unable to alloc data\n");
+		return -ENOMEM;
+	}
+	pr_info("allocated RAMdisk");
+	return 0;
+}
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -54,12 +156,10 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	nbytes = len << SBDD_SECTOR_SHIFT;
 
 	spin_lock(&__sbdd.datalock);
-
 	if (dir)
 		memcpy(__sbdd.data + offset, buff, nbytes);
 	else
 		memcpy(buff, __sbdd.data + offset, nbytes);
-
 	spin_unlock(&__sbdd.datalock);
 
 	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
@@ -67,7 +167,33 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	return len;
 }
 
-static void sbdd_xfer_bio(struct bio *bio)
+static void blkdev_end_io(struct bio *bio) {
+	struct bio *b = bio->bi_private;
+	if (bio->bi_status)
+	{
+		// If any error occured on underlying device, set initial BIO as error
+		bio_io_error(b);
+	}
+	// clone_bio_fast creates new BIO with one refence, we net to free it
+	bio_put(bio);
+
+	bio_endio(b);
+}
+
+static void sbdd_xfer_bio_blkdev(struct bio *bio) {
+	struct bio *new_bio = bio_clone_fast(bio, GFP_NOIO, &fs_bio_set);
+	bio_set_dev(new_bio, __sbdd.blk_dev);
+
+	/*
+	Adding in private field initial BIO to end it as soon, as BIO to corresponding 
+	real block device ends
+	*/
+	new_bio->bi_private = bio;
+	new_bio->bi_end_io = blkdev_end_io;
+	submit_bio(new_bio);
+}
+
+static void sbdd_xfer_bio_ram(struct bio *bio)
 {
 	struct bvec_iter iter;
 	struct bio_vec bvec;
@@ -76,6 +202,8 @@ static void sbdd_xfer_bio(struct bio *bio)
 
 	bio_for_each_segment(bvec, bio, iter)
 		pos += sbdd_xfer(&bvec, pos, dir);
+	
+	bio_endio(bio);
 }
 
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
@@ -87,9 +215,11 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 	}
 
 	atomic_inc(&__sbdd.refs_cnt);
-
-	sbdd_xfer_bio(bio);
-	bio_endio(bio);
+	/*
+	In attempt to make code more universal, BIO processing method is stored as
+	struct member. Also processing method is now responsible for ending BIO.
+	*/
+	__sbdd.process_bio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
 		wake_up(&__sbdd.exitwait);
@@ -121,14 +251,33 @@ static int sbdd_create(void)
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
-
+	
 	pr_info("allocating data\n");
-	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
+	if (dev_mode == RAMDRIVE)
+	{
+		__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
+		int ret_alloc_ram = __alloc_ramdrive();
+		if(ret_alloc_ram)
+		{
+			pr_err("__alloc_ramdrive returned %d", ret_alloc_ram);
+			return -EINVAL;
+		}
+		__sbdd.process_bio = sbdd_xfer_bio_ram;
 	}
+	else if (dev_mode == BLKDEV) {
+		int ret_acq_blkdev = __acquire_blkdev();
+		if(ret_acq_blkdev) {
+			pr_err("__acquire_blkdev returned %d", ret_acq_blkdev);
+			return -EINVAL;
+		}
+		__sbdd.process_bio = sbdd_xfer_bio_blkdev;
+		__sbdd.capacity = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->nr_sects;
+	}
+	else
+		{
+			pr_err("Unknown device mode");
+			return -EINVAL;
+		}
 
 	spin_lock_init(&__sbdd.datalock);
 	init_waitqueue_head(&__sbdd.exitwait);
@@ -188,9 +337,10 @@ static void sbdd_delete(void)
 	if (__sbdd.gd)
 		put_disk(__sbdd.gd);
 
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
+	if (dev_mode == RAMDRIVE)
+		__dealloc_ramdrive();
+	else if (dev_mode == BLKDEV) {
+		__release_blkdev();
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
@@ -236,6 +386,12 @@ static void __exit sbdd_exit(void)
 	pr_info("exiting complete\n");
 }
 
+
+static const struct kernel_param_ops devmode_op_ops = {
+	.set = devmode_op_write_handler,
+	.get = devmode_op_read_handler
+};
+
 /* Called on module loading. Is mandatory. */
 module_init(sbdd_init);
 
@@ -243,7 +399,9 @@ module_init(sbdd_init);
 module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
-module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, 0444);
+module_param_named(block_device, __devname, charp, 0444);
+module_param_cb(device_mode, &devmode_op_ops, NULL, 0444);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
