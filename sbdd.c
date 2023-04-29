@@ -44,7 +44,6 @@ struct sbdd {
 	struct request_queue    *q;
 	void (*process_bio)(struct bio *bio);
 	struct block_device		*blk_dev;
-	sector_t 				start_sect;
 };
 
 static struct sbdd      __sbdd;
@@ -60,8 +59,6 @@ static int __alloc_ramdrive(void);
 
 
 static int devmode_op_write_handler(const char *val, const struct kernel_param *kp) {
-
-	//TODO: Add On the fly mode change
 	char valcp[16];
 	char *s;
 
@@ -165,29 +162,35 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 		memcpy(buff, __sbdd.data + offset, nbytes);
 	spin_unlock(&__sbdd.datalock);
 
-	pr_info("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
+	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
 
 	return len;
 }
 
 static void blkdev_end_io(struct bio *bio) {
 	struct bio *b = bio->bi_private;
-	pr_info("Ended BIO request (I suppose?)");
+	if (bio->bi_status)
+	{
+		// If any error occured on underlying device, set initial BIO as error
+		bio_io_error(b);
+	}
+	// clone_bio_fast creates new BIO with one refence, we net to free it
 	bio_put(bio);
-	pr_info("Put done BIO");
+
 	bio_endio(b);
-	pr_info("Ended initial BIO");
 }
 
 static void sbdd_xfer_bio_blkdev(struct bio *bio) {
 	struct bio *new_bio = bio_clone_fast(bio, GFP_NOIO, &fs_bio_set);
 	bio_set_dev(new_bio, __sbdd.blk_dev);
-	pr_info("New BIO start and length %d %d", new_bio->bi_iter.bi_sector, new_bio->bi_iter.bi_size >> SBDD_SECTOR_SHIFT);
-	pr_info("BIOs op flags: old %X, new %X", bio->bi_opf, new_bio->bi_opf);
+
+	/*
+	Adding in private field initial BIO to end it as soon, as BIO to corresponding 
+	real block device ends
+	*/
 	new_bio->bi_private = bio;
 	new_bio->bi_end_io = blkdev_end_io;
 	submit_bio(new_bio);
-	pr_info("Submitted new BIO");
 }
 
 static void sbdd_xfer_bio_ram(struct bio *bio)
@@ -212,7 +215,10 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 	}
 
 	atomic_inc(&__sbdd.refs_cnt);
-
+	/*
+	In attempt to make code more universal, BIO processing method is stored as
+	struct member. Also processing method is now responsible for ending BIO.
+	*/
 	__sbdd.process_bio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
@@ -266,7 +272,6 @@ static int sbdd_create(void)
 		}
 		__sbdd.process_bio = sbdd_xfer_bio_blkdev;
 		__sbdd.capacity = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->nr_sects;
-		__sbdd.start_sect = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->start_sect;
 	}
 	else
 		{
@@ -396,7 +401,7 @@ module_exit(sbdd_exit);
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, 0444);
 module_param_named(block_device, __devname, charp, 0444);
-module_param_cb(device_mode, &devmode_op_ops, NULL, 0664);
+module_param_cb(device_mode, &devmode_op_ops, NULL, 0444);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
