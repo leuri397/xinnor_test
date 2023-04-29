@@ -113,7 +113,7 @@ static int __acquire_blkdev(void) {
 		pr_err("No name for block device provided");
 		return -EINVAL;
 	}
-	__sbdd.blk_dev = blkdev_get_by_path(__devname, FMODE_READ | FMODE_WRITE, THIS_MODULE);
+	__sbdd.blk_dev = blkdev_get_by_path(__devname, FMODE_READ | FMODE_WRITE | FMODE_EXCL, THIS_MODULE);
 	if (IS_ERR(__sbdd.blk_dev))
 	{
 		pr_err("Error occured during opening of block_device");
@@ -125,7 +125,7 @@ static int __acquire_blkdev(void) {
 }
 
 static void __release_blkdev(void) {
-	blkdev_put(__sbdd.blk_dev, FMODE_READ | FMODE_WRITE);
+	blkdev_put(__sbdd.blk_dev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
 }
 
 static void __dealloc_ramdrive(void) {
@@ -165,23 +165,29 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 		memcpy(buff, __sbdd.data + offset, nbytes);
 	spin_unlock(&__sbdd.datalock);
 
-	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
+	pr_info("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
 
 	return len;
 }
 
+static void blkdev_end_io(struct bio *bio) {
+	struct bio *b = bio->bi_private;
+	pr_info("Ended BIO request (I suppose?)");
+	bio_put(bio);
+	pr_info("Put done BIO");
+	bio_endio(b);
+	pr_info("Ended initial BIO");
+}
+
 static void sbdd_xfer_bio_blkdev(struct bio *bio) {
-	pr_info("Requested start and length %d %d", bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
-	struct bio *new_bio = bio_clone_fast(bio, GFP_KERNEL, &fs_bio_set);
-	pr_info("Cloned BIO. BIO device: %s", new_bio->bi_disk->disk_name);
+	struct bio *new_bio = bio_clone_fast(bio, GFP_NOIO, &fs_bio_set);
 	bio_set_dev(new_bio, __sbdd.blk_dev);
-	// Respect partitions
-	// new_bio->bi_iter.bi_sector += __sbdd.start_sect;
-	pr_info("New BIO start and length %d %d", new_bio->bi_iter.bi_sector, new_bio->bi_iter.bi_size);
-	pr_info("Cloned BIO device: %s", new_bio->bi_disk->disk_name);
-	submit_bio_wait(new_bio);
+	pr_info("New BIO start and length %d %d", new_bio->bi_iter.bi_sector, new_bio->bi_iter.bi_size >> SBDD_SECTOR_SHIFT);
+	pr_info("BIOs op flags: old %X, new %X", bio->bi_opf, new_bio->bi_opf);
+	new_bio->bi_private = bio;
+	new_bio->bi_end_io = blkdev_end_io;
+	submit_bio(new_bio);
 	pr_info("Submitted new BIO");
-	bio_put(new_bio);
 }
 
 static void sbdd_xfer_bio_ram(struct bio *bio)
@@ -193,6 +199,8 @@ static void sbdd_xfer_bio_ram(struct bio *bio)
 
 	bio_for_each_segment(bvec, bio, iter)
 		pos += sbdd_xfer(&bvec, pos, dir);
+	
+	bio_endio(bio);
 }
 
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
@@ -205,16 +213,7 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 
 	atomic_inc(&__sbdd.refs_cnt);
 
-	/*
-	Since we now could have situation with method changing during IO,
-	we move datalock from copying in memory to performing request
-	*/
-
-	bio_get(bio);
 	__sbdd.process_bio(bio);
-	bio_put(bio);
-	
-	bio_endio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
 		wake_up(&__sbdd.exitwait);
@@ -245,7 +244,6 @@ static int sbdd_create(void)
 		return -EBUSY;
 	}
 
-	int sector_size = SBDD_SECTOR_SIZE;
 	memset(&__sbdd, 0, sizeof(struct sbdd));
 	
 	pr_info("allocating data\n");
@@ -269,8 +267,6 @@ static int sbdd_create(void)
 		__sbdd.process_bio = sbdd_xfer_bio_blkdev;
 		__sbdd.capacity = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->nr_sects;
 		__sbdd.start_sect = disk_get_part(__sbdd.blk_dev->bd_disk, __sbdd.blk_dev->bd_partno)->start_sect;
-		sector_size = __sbdd.blk_dev->bd_block_size;
-		pr_info("Set sector size for device %d", sector_size);
 	}
 	else
 		{
@@ -290,7 +286,7 @@ static int sbdd_create(void)
 	blk_queue_make_request(__sbdd.q, sbdd_make_request);
 
 	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.q, sector_size);
+	blk_queue_logical_block_size(__sbdd.q, SBDD_SECTOR_SIZE);
 
 	/* A disk must have at least one minor */
 	pr_info("allocating disk\n");
