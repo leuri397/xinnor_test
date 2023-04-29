@@ -1,3 +1,7 @@
 Task_0
 
 Module was build on Oracle Linux 8.5 virtual machine and tested by inserting, creating filesystem on /dev/sbdd and writing file to it
+
+Task_1
+
+Added second mode to module to act not only as RAM disk, but also as stacking block device
